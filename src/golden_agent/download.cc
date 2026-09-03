@@ -60,6 +60,12 @@ public:
             std::string out;
             if (!r_->read_some(out)) {
                 if (r_->failed()) {
+                    if (r_->cap_exceeded()) {
+                        // Local policy violation, not a transport problem:
+                        // no retry can fix it.
+                        throw ModelDownloadError("response body exceeded "
+                                                 "max_bytes limit: " + r_->error());
+                    }
                     transport_error_ = r_->error();
                     throw TransportError(transport_error_);
                 }

@@ -50,6 +50,7 @@ ar rcs build/libga.a build/util.o build/json.o build/http.o build/archive.o buil
 g++ -std=c++26 -O2 -Wall -Wextra -Isrc -Isrc/golden_agent src/golden_agent/server_daemon.cc build/libga.a -lcurl -lz -lpthread -o build/server_daemon
 g++ -std=c++26 -O2 -Wall -Wextra -Isrc -Isrc/golden_agent tests/test_backend.cc build/libga.a -lcurl -lz -lpthread -o build/test_backend
 g++ -std=c++26 -O2 -Wall -Wextra -Isrc -Isrc/golden_agent tests/test_download.cc build/libga.a -lcurl -lz -lpthread -o build/test_download
+g++ -std=c++26 -O2 -Wall -Wextra -Isrc -Isrc/golden_agent tests/test_http.cc build/libga.a -lcurl -lz -lpthread -o build/test_http
 ```
 
 What you get in `build/`:
@@ -60,6 +61,8 @@ What you get in `build/`:
 | `server_daemon`   | Standalone daemon binary (spawns/watches `llama-server` for you)   |
 | `test_backend`    | 41 backend tests (daemon spawn, stop, hookpoint, GPU→CPU fallback) |
 | `test_download`   | 30 download tests (resume, retry, size verification)              |
+| `test_http`       | 24 http-layer tests (slist lifetime regression, body-cap
+|                       enforcement, 1 MiB streaming)                  |
 
 ---
 
@@ -77,11 +80,14 @@ Expected output (tail):
 41 passed, 0 failed
 == build/test_download
 OK: 30 checks passed
+== build/test_http
+OK: 24 checks passed
 ALL TESTS PASSED
 ```
 
-Both suites run **without network access** — HTTP is faked with a local
-listener and the daemon is exercised for real. You can run this on a plane.
+All three suites run **without network access** — HTTP is served by a local
+in-process TCP listener (an ephemeral port on `127.0.0.1`) and the daemon
+is exercised for real. You can run this on a plane.
 
 ---
 
@@ -347,6 +353,16 @@ std::string ga::server_url(int port, const std::string& host);  // "http://127.0
 HttpResponse ga::http::get(url);
 HttpResponse ga::http::request(method, url, body, headers, timeout_sec, max_body);
 // HttpResponse has .status (int) and .body (std::string)
+//
+// Error contract:
+//   HttpError e — transport/HTTP errors (e.status is the HTTP code when the
+//                 server answered, 0 when it was a network failure)
+//   BodyLimitExceeded (a subclass of HttpError) — the response body exceeded
+//                 max_body; thrown instead of silently truncating
+//   Streaming (ga::http::curl_reader): cap violations surface as
+//                 reader->failed() + cap_exceeded() + error(), so callers can
+//                 distinguish "policy" failures (no retry helps) from
+//                 "transport" failures (retry).
 ```
 
 Link against it: `build/libga.a -lcurl -lz -lpthread` (plus `-Isrc/golden_agent`
@@ -362,3 +378,14 @@ correct contract. libcurl's header callback must return the number of bytes
 consumed (`size * nmemb`); returning 0 makes libcurl think nothing was read.
 This exact bug bit the port once, and the tests in `test_download.cc` guard
 it.
+
+Two more lifetime/policy gotchas in the same file, both regression-tested by
+`test_http.cc`:
+
+- The header `curl_slist` must outlive `curl_easy_perform`. It is owned by
+  the RAII `CurlReq` struct (freed in its destructor, *after* the transfer),
+  never freed by hand mid-request.
+- The write callbacks enforce the body cap by returning `0` (not the number
+  of bytes "processed") when the cap is hit. libcurl then aborts with
+  `CURLE_WRITE_ERROR`, and the layer converts that into
+  `BodyLimitExceeded` / `cap_exceeded()` instead of silently truncating.

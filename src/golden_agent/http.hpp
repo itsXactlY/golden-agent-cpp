@@ -28,8 +28,17 @@ public:
     HttpError(const std::string& msg, int code) : std::runtime_error(msg), status(code) {}
 };
 
+// Raised when the response body exceeds the caller's max_body/max_bytes limit.
+// Unlike HttpError this is a local policy violation, not a transport failure:
+// the transfer is aborted as soon as the cap is reached.
+class BodyLimitExceeded : public HttpError {
+public:
+    explicit BodyLimitExceeded(const std::string& msg) : HttpError(msg, 0) {}
+};
+
 // One-shot request. Throws HttpError on HTTP >= 400 (like urllib raising
-// HTTPError) or transport failure. Redirects are followed.
+// HTTPError), transport failure, or BodyLimitExceeded when the response body
+// exceeds max_body. Redirects are followed.
 HttpResponse request(const std::string& method, const std::string& url,
                      const std::string& body = "", const HeaderVec& extra_headers = {},
                      int timeout_sec = 30, std::size_t max_body = SIZE_MAX);
@@ -53,6 +62,9 @@ public:
     void close();
     bool failed() const { return failed_; }
     const std::string& error() const { return error_; }
+    // True when the transfer was aborted by a local max_bytes policy, not by
+    // a network/transport problem. Retries cannot fix a cap violation.
+    virtual bool cap_exceeded() const { return false; }
 
 protected:
     void fail(const std::string& msg, int status = 0);

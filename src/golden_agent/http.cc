@@ -54,11 +54,44 @@ std::string header_line(const std::pair<std::string, std::string>& h) {
     return h.first + ": " + h.second;
 }
 
-CURL* make_handle(const std::string& method, const std::string& url, const std::string& body,
-                  const HeaderVec& headers, int connect_timeout, int read_timeout,
-                  std::size_t max_bytes, size_t(*writefn)(char*, size_t, size_t, void*), void* userdata) {
-    CURL* c = curl_easy_init();
-    if (!c) throw HttpError("curl init failed", 0);
+// One libcurl transfer unit. The request-header slist must outlive
+// curl_easy_perform — libcurl reads it during the transfer — so it is kept
+// alongside the handle and both are released together, after the transfer.
+// (Freeing the slist immediately after setopt is a use-after-free.)
+struct CurlReq {
+    CURL* handle = nullptr;
+    curl_slist* headers = nullptr;
+    CurlReq() = default;
+    ~CurlReq() {
+        if (headers) curl_slist_free_all(headers);
+        if (handle) curl_easy_cleanup(handle);
+    }
+    CurlReq(const CurlReq&) = delete;
+    CurlReq& operator=(const CurlReq&) = delete;
+    CurlReq(CurlReq&& o) noexcept : handle(o.handle), headers(o.headers) {
+        o.handle = nullptr;
+        o.headers = nullptr;
+    }
+    CurlReq& operator=(CurlReq&& o) noexcept {
+        if (this != &o) {
+            if (headers) curl_slist_free_all(headers);
+            if (handle) curl_easy_cleanup(handle);
+            handle = o.handle;
+            headers = o.headers;
+            o.handle = nullptr;
+            o.headers = nullptr;
+        }
+        return *this;
+    }
+};
+
+CurlReq make_handle(const std::string& method, const std::string& url, const std::string& body,
+                    const HeaderVec& headers, int connect_timeout, int read_timeout,
+                    std::size_t max_bytes, size_t(*writefn)(char*, size_t, size_t, void*), void* userdata) {
+    CurlReq req;
+    req.handle = curl_easy_init();
+    if (!req.handle) throw HttpError("curl init failed", 0);
+    CURL* c = req.handle;
     curl_easy_setopt(c, CURLOPT_URL, url.c_str());
     curl_easy_setopt(c, CURLOPT_FOLLOWLOCATION, 1L);
     curl_easy_setopt(c, CURLOPT_USERAGENT, "golden-agent/0.1");
@@ -77,12 +110,12 @@ CURL* make_handle(const std::string& method, const std::string& url, const std::
         curl_slist* list = nullptr;
         for (const auto& h : headers) list = curl_slist_append(list, header_line(h).c_str());
         curl_easy_setopt(c, CURLOPT_HTTPHEADER, list);
-        curl_slist_free_all(list);
+        req.headers = list;  // ownership transfers; ~CurlReq frees it post-transfer
     }
     curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, writefn);
     curl_easy_setopt(c, CURLOPT_WRITEDATA, userdata);
     (void)max_bytes;
-    return c;
+    return req;
 }
 
 }  // namespace
@@ -107,10 +140,14 @@ size_t write_cap(char* ptr, size_t size, size_t nmemb, void* userdata) {
         st->body.append(ptr, room);
         st->received += room;
         st->over = true;
-    } else {
-        st->body.append(ptr, total);
-        st->received += total;
+        // Returning 0 (not `total`) tells libcurl the write failed and
+        // aborts the transfer with CURLE_WRITE_ERROR — the only correct way
+        // to enforce a hard cap. Returning bytes not actually consumed
+        // violates the write-callback contract.
+        return 0;
     }
+    st->body.append(ptr, total);
+    st->received += total;
     return total;
 }
 
@@ -124,14 +161,17 @@ HttpResponse request(const std::string& method, const std::string& url, const st
     std::string content_type;
     auto* hud = new std::pair<std::map<std::string, std::string>*, std::string*>(&headers, &content_type);
 
-    CURL* c = make_handle(method, url, body, extra_headers, 10, timeout_sec, max_body, write_cap, &st);
-    curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_cb);
-    curl_easy_setopt(c, CURLOPT_HEADERDATA, hud);
+    CurlReq req = make_handle(method, url, body, extra_headers, 10, timeout_sec, max_body, write_cap, &st);
+    curl_easy_setopt(req.handle, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(req.handle, CURLOPT_HEADERDATA, hud);
 
-    CURLcode rc = curl_easy_perform(c);
-    curl_easy_cleanup(c);
+    CURLcode rc = curl_easy_perform(req.handle);
+    const bool over = st.over;
+    // req is destroyed at scope exit: slist + handle freed after the transfer.
     delete hud;
 
+    if (over) throw BodyLimitExceeded("response body exceeds max_body limit (" +
+                                      std::to_string(max_body) + " bytes)");
     if (rc != CURLE_OK) throw HttpError(std::string("transport error: ") + curl_easy_strerror(rc), 0);
     long status = 0;
     auto it = headers.find("__status__");
@@ -183,10 +223,13 @@ struct CurlReader : Reader {
             if (room < total) {
                 self->buf.append(ptr, room);
                 self->received += room;
-                self->over_cap_flag = true;
             }
+            self->over_cap_flag = true;
             self->cv.notify_all();
-            return total;
+            // Returning 0 aborts the transfer with CURLE_WRITE_ERROR:
+            // hard cap, not a silent truncation (which would corrupt a
+            // partial download while still reporting "complete").
+            return 0;
         }
         self->buf.append(ptr, total);
         self->received += total;
@@ -199,26 +242,35 @@ struct CurlReader : Reader {
         std::map<std::string, std::string> headers_map;
         std::string ct_local;
         auto* hud = new std::pair<std::map<std::string, std::string>*, std::string*>(&headers_map, &ct_local);
-        CURL* c = make_handle(method, url, body, headers, connect_timeout, read_timeout,
-                             max_bytes, write_cb, this);
-        if (!c) {
-            std::lock_guard lk(mu);
-            failed_ = true;
-            error_ = "curl init failed";
-            done = true;
-            cv.notify_all();
-            return;
+        CURLcode rc = CURLE_OK;
+        bool init_failed = false;
+        {
+            CurlReq req;
+            try {
+                req = make_handle(method, url, body, headers, connect_timeout, read_timeout,
+                                 max_bytes, write_cb, this);
+            } catch (const HttpError&) {
+                init_failed = true;
+            }
+            if (!init_failed) {
+                curl_easy_setopt(req.handle, CURLOPT_HEADERFUNCTION, header_cb);
+                curl_easy_setopt(req.handle, CURLOPT_HEADERDATA, hud);
+                rc = curl_easy_perform(req.handle);
+            }
+            // req destroyed here: slist + handle freed after the transfer.
         }
-        curl_easy_setopt(c, CURLOPT_HEADERFUNCTION, header_cb);
-        curl_easy_setopt(c, CURLOPT_HEADERDATA, hud);
-        CURLcode rc = curl_easy_perform(c);
-        curl_easy_cleanup(c);
         delete hud;
         std::lock_guard lk(mu);
         auto it = headers_map.find("__status__");
         if (it != headers_map.end()) code = std::atoi(it->second.c_str());
         ct = std::move(ct_local);
-        if (rc != CURLE_OK) {
+        if (init_failed) {
+            failed_ = true;
+            error_ = "curl init failed";
+        } else if (over_cap_flag) {
+            failed_ = true;
+            error_ = "response body exceeds max_bytes limit (" + std::to_string(max_bytes) + " bytes)";
+        } else if (rc != CURLE_OK) {
             failed_ = true;
             error_ = std::string("transport error: ") + curl_easy_strerror(rc);
         }
@@ -230,6 +282,10 @@ public:
     std::string ct;
     bool over_cap_flag = false;
 
+    bool cap_exceeded() const override {
+        std::lock_guard lk(mu);
+        return over_cap_flag;
+    }
     int status() const {
         std::lock_guard lk(mu);
         return code;
