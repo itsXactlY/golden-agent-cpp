@@ -46,7 +46,16 @@ std::vector<std::string> build_server_args(const ModelSpec& spec,
 std::string cache_dir();
 
 // _server_binary_path(backend)
+//
+// Resolves, in order: GA_SERVER_BINARY, a built adaptive-KV llama-server, then
+// the stock download path. The fork keeps the KV cache in pinned host memory
+// rather than VRAM, which is what lets a 27B model hold a six-figure context on
+// a 16 GB card.
 std::string server_binary_path(Backend backend = Backend::CPU);
+
+// The stock download location, ignoring the fork. Used as the fallback when the
+// fork cannot be built on this machine.
+std::string server_binary_path_stock(Backend backend = Backend::CPU);
 
 // _ensure_server_binary(backend, log) — download + extract if missing.
 std::string ensure_server_binary(Backend backend = Backend::CPU, LogFn log = nullptr);

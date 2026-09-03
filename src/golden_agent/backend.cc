@@ -112,7 +112,110 @@ std::string cache_dir() {
     return path_join(path_join(base, "golden-agent"), "server");
 }
 
+// Run a command to completion with its output on our stdout/stderr, so a long
+// build shows progress instead of looking hung. Returns the exit status, or
+// -1 when the child could not be started.
+static int run_and_wait(const std::vector<std::string>& args) {
+    if (args.empty()) return -1;
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        std::vector<char*> argv;
+        argv.reserve(args.size() + 1);
+        for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+        argv.push_back(nullptr);
+        execvp(argv[0], argv.data());
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static std::string path_dirname(const std::string& p) {
+    auto pos = p.find_last_of('/');
+    if (pos == std::string::npos) return ".";
+    if (pos == 0) return "/";
+    return p.substr(0, pos);
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive KV streaming
+//
+// Stock llama.cpp keeps the whole KV cache in VRAM, which caps a 27B model at a
+// small context on a 16 GB card. The adaptive-KV fork keeps the authoritative
+// tensors in pinned host memory and only a bounded pool of pages on the GPU, so
+// the same card holds a six-figure context. That is the difference between "a
+// local model" and "a local model you can actually work with", so this is where
+// the server comes from when it is available.
+//
+//   GA_SERVER_BINARY  use exactly this llama-server, skip everything below
+//   GA_LLAMA_SRC      where the fork lives (default ~/projects/llama.cpp-adaptive-kv-streaming)
+//   GA_LLAMA_REPO     where to clone it from
+//   GA_NO_ADAPTIVE_KV set to any value to force the stock download
+// ---------------------------------------------------------------------------
+
+static std::string env_or(const char* name, const std::string& fallback) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? std::string(v) : fallback;
+}
+
+static std::string adaptive_kv_src() {
+    return path_expand_user(env_or("GA_LLAMA_SRC",
+                                   "~/projects/llama.cpp-adaptive-kv-streaming"));
+}
+
+static std::string adaptive_kv_binary() {
+    return path_join(path_join(adaptive_kv_src(), "build"), "bin/llama-server");
+}
+
+// Clone and build the fork. Returns the binary path, or "" when it could not be
+// produced -- the caller then falls back to the stock download rather than
+// leaving the user with nothing.
+static std::string build_adaptive_kv(LogFn log) {
+    LogFn logger = log ? log : default_log;
+    const std::string src  = adaptive_kv_src();
+    const std::string repo = env_or("GA_LLAMA_REPO",
+        "https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming");
+
+    if (!dir_exists(path_join(src, ".git"))) {
+        logger("cloning adaptive-KV llama.cpp into " + src);
+        make_dirs(path_dirname(src));
+        int rc = run_and_wait({"git", "clone", "--depth", "1", "--branch",
+                               "feature/adaptive-kv-stream", repo, src});
+        if (rc != 0) {
+            logger("clone failed (rc=" + std::to_string(rc) + ") — using stock llama.cpp");
+            return {};
+        }
+    }
+
+    logger("building adaptive-KV llama-server (this takes a while)");
+    int rc = run_and_wait({"cmake", "-S", src, "-B", path_join(src, "build"),
+                           "-DGGML_CUDA=ON", "-DGGML_CUDA_FA_ALL_QUANTS=ON",
+                           "-DCMAKE_BUILD_TYPE=Release"});
+    if (rc == 0) {
+        rc = run_and_wait({"cmake", "--build", path_join(src, "build"),
+                           "--config", "Release", "--target", "llama-server", "-j"});
+    }
+    if (rc != 0 || !file_exists(adaptive_kv_binary())) {
+        logger("adaptive-KV build failed (rc=" + std::to_string(rc) +
+               ") — using stock llama.cpp");
+        return {};
+    }
+    logger("adaptive-KV llama-server ready");
+    return adaptive_kv_binary();
+}
+
 std::string server_binary_path(Backend backend) {
+    const char* forced = std::getenv("GA_SERVER_BINARY");
+    if (forced && *forced) return path_expand_user(forced);
+    if (!std::getenv("GA_NO_ADAPTIVE_KV") && file_exists(adaptive_kv_binary())) {
+        return adaptive_kv_binary();
+    }
+    return server_binary_path_stock(backend);
+}
+
+std::string server_binary_path_stock(Backend backend) {
     std::string name = backend_value(backend);
 #ifdef _WIN32
     return path_join(cache_dir(), "llama-" + name + ".exe");
@@ -125,6 +228,15 @@ std::string ensure_server_binary(Backend backend, LogFn log) {
     LogFn logger = log ? log : default_log;
     std::string binary = server_binary_path(backend);
     if (file_exists(binary)) return binary;
+
+    // Prefer the fork. Only when it cannot be produced do we fetch stock, so a
+    // machine without a CUDA toolchain still ends up with a working server.
+    if (!std::getenv("GA_SERVER_BINARY") && !std::getenv("GA_NO_ADAPTIVE_KV")) {
+        std::string forked = build_adaptive_kv(logger);
+        if (!forked.empty()) return forked;
+        binary = server_binary_path_stock(backend);
+        if (file_exists(binary)) return binary;
+    }
 
     make_dirs(cache_dir());
     std::string url = server_download_url("", backend, "");

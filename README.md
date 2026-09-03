@@ -6,6 +6,22 @@ binary (with resume + retry), spawn the server under a supervised daemon, reap
 it via a hookpoint sentinel, and fall back GPU → CPU when a GPU backend is
 unavailable.
 
+**The server it runs is the adaptive-KV-streaming build, not stock llama.cpp.**
+Stock keeps the whole KV cache in graphics memory, which caps a 27B model at a
+small context on a 16 GB card. The
+[fork](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
+keeps that cache in ordinary system RAM and holds only the pages it is reading
+on the GPU, so the same card runs a six-figure context. It is cloned and built
+on first use; if that fails — no CUDA toolchain, no network — the stock binary
+is downloaded instead, so you still end up with a working server.
+
+| variable | effect |
+|---|---|
+| `GA_SERVER_BINARY` | run exactly this `llama-server`, skip the rest |
+| `GA_LLAMA_SRC` | where the fork lives (default `~/projects/llama.cpp-adaptive-kv-streaming`) |
+| `GA_LLAMA_REPO` | where to clone it from |
+| `GA_NO_ADAPTIVE_KV` | set to anything to force the stock download |
+
 Everything below is a **complete, copy-paste-able walkthrough** — every command
 is one you can run verbatim, and every output is what you will actually see.
 

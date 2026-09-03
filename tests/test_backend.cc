@@ -282,8 +282,46 @@ static void t_stop_already_stopped() {
     CHECK(st.server_port == 0);
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive KV streaming: which llama-server do we actually run?
+//
+// Stock llama.cpp holds the whole KV cache in VRAM, which caps a 27B model at a
+// small context on a 16 GB card. The fork keeps it in pinned host memory, which
+// is the entire reason this project points at it. Getting the resolution order
+// wrong silently downgrades every user to the small-context build.
+// ---------------------------------------------------------------------------
+static void test_adaptive_kv_resolution() {
+    using namespace ga;
+    const char* prev_forced = std::getenv("GA_SERVER_BINARY");
+    const char* prev_off    = std::getenv("GA_NO_ADAPTIVE_KV");
+    const char* prev_src    = std::getenv("GA_LLAMA_SRC");
+    unsetenv("GA_SERVER_BINARY");
+    unsetenv("GA_NO_ADAPTIVE_KV");
+
+    // An explicit binary always wins, whatever else is on the machine.
+    setenv("GA_SERVER_BINARY", "/opt/probe/llama-server", 1);
+    CHECK(server_binary_path(Backend::CUDA) == "/opt/probe/llama-server");
+    unsetenv("GA_SERVER_BINARY");
+
+    // Opting out lands on the stock path.
+    setenv("GA_NO_ADAPTIVE_KV", "1", 1);
+    CHECK(server_binary_path(Backend::CUDA) == server_binary_path_stock(Backend::CUDA));
+    unsetenv("GA_NO_ADAPTIVE_KV");
+
+    // With no fork built anywhere, stock is the answer -- never an empty path.
+    setenv("GA_LLAMA_SRC", "/nonexistent/adaptive-kv", 1);
+    CHECK(server_binary_path(Backend::CUDA) == server_binary_path_stock(Backend::CUDA));
+    CHECK(!server_binary_path(Backend::CUDA).empty());
+    unsetenv("GA_LLAMA_SRC");
+
+    if (prev_forced) setenv("GA_SERVER_BINARY", prev_forced, 1);
+    if (prev_off)    setenv("GA_NO_ADAPTIVE_KV", prev_off, 1);
+    if (prev_src)    setenv("GA_LLAMA_SRC", prev_src, 1);
+}
+
 int main() {
     const struct { const char* name; void (*fn)(); } tests[] = {
+        {"adaptive_kv_resolution", test_adaptive_kv_resolution},
         {"build_server_args_cpu_no_ngl", t_build_cpu_no_ngl},
         {"build_server_args_with_ctx", t_build_with_ctx},
         {"build_server_args_with_draft", t_build_with_draft},
