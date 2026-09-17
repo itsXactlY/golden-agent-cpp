@@ -1,10 +1,25 @@
 # Golden-Agent C++
 
-C++26 port of the Golden-Agent backend from the Python codebase. It manages the
-full lifecycle of a local `llama-server`: download the model and the server
-binary (with resume + retry), spawn the server under a supervised daemon, reap
-it via a hookpoint sentinel, and fall back GPU → CPU when a GPU backend is
-unavailable.
+A C++26 port of the Golden-Agent backend from the Python codebase of [Golden-Agent](https://github.com/yashneil75/Golden-Agent?utm_source=chatgpt.com).
+
+Golden-Agent manages the complete lifecycle of a local `llama-server`: downloading models and server binaries with resume and retry support, spawning and supervising the server as a daemon, reaping it through a hookpoint sentinel, and automatically falling back from GPU to CPU when a GPU backend is unavailable.
+
+The project originated as a proof of concept exploring how far a local LLM stack can be pushed by deliberately embracing a **less-is-more** philosophy: fewer assumptions, fewer persistent dependencies, and a tightly controlled execution lifecycle.
+
+### Built by an Amnesiac Agent
+
+This C++ port was produced as the result of a **one-shot agentic task** executed by an agent harness deliberately designed to forget its past.
+
+No accumulated project memory.
+No iterative hand-holding.
+No historical context carried between runs.
+
+**Amnesia by design. Not a bug. A design choice.**
+
+The result is therefore also an experiment in something beyond the implementation itself: whether an agent, given a sufficiently constrained environment and a well-defined objective, can reconstruct and deliver a complete systems-level component without relying on the continuity of previous interactions.
+
+Golden-Agent C++ is both the resulting implementation and a small proof of that concept.
+
 
 **The server it runs is the adaptive-KV-streaming build, not stock llama.cpp.**
 Stock keeps the whole KV cache in graphics memory, which caps a 27B model at a
