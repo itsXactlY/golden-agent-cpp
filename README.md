@@ -24,7 +24,7 @@ Golden-Agent C++ is both the resulting implementation and a small proof of that 
 **The server it runs is the adaptive-KV-streaming build, not stock llama.cpp.**
 Stock keeps the whole KV cache in graphics memory, which caps a 27B model at a
 small context on a 16 GB card. The
-[fork](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)
+[fork](RaymondHuang210129/llama.cpp-adaptive-kv-streaming](https://github.com/itsXactlY/llama.cpp-adaptive-kv-streaming))
 keeps that cache in ordinary system RAM and holds only the pages it is reading
 on the GPU, so the same card runs a six-figure context. It is cloned and built
 on first use; if that fails — no CUDA toolchain, no network — the stock binary
